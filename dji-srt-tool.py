@@ -14,8 +14,41 @@ import curses
 import argparse
 from datetime import timedelta
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
+
+
+# ─────────────────────────────────────────────
+#  UNIT CONVERSIONS
+# ─────────────────────────────────────────────
+
+# Each entry: field_name -> (metric_suffix, imperial_suffix, conversion_fn)
+# conversion_fn receives a float in metric units, returns float in imperial.
+UNIT_CONVERSIONS: dict[str, tuple[str, str, callable]] = {
+    "rel_alt":  ("m",   "ft",  lambda v: v * 3.28084),
+    "abs_alt":  ("m",   "ft",  lambda v: v * 3.28084),
+    "altitude": ("m",   "ft",  lambda v: v * 3.28084),
+    "height":   ("m",   "ft",  lambda v: v * 3.28084),
+    "speed":    ("m/s", "mph", lambda v: v * 2.23694),
+    "h_speed":  ("m/s", "mph", lambda v: v * 2.23694),
+    "v_speed":  ("m/s", "mph", lambda v: v * 2.23694),
+    "distance": ("m",   "ft",  lambda v: v * 3.28084),
+}
+
+
+def convert_value(field: str, raw: str, imperial: bool) -> str:
+    """Return raw value with unit suffix, converting to imperial if requested."""
+    if field not in UNIT_CONVERSIONS:
+        return raw  # no conversion defined — return as-is
+    metric_sfx, imperial_sfx, fn = UNIT_CONVERSIONS[field]
+    try:
+        fval = float(raw)
+    except ValueError:
+        return raw  # not numeric — return as-is
+    if imperial:
+        return f"{fn(fval):.1f}{imperial_sfx}"
+    else:
+        return f"{fval:.2f}{metric_sfx}".rstrip("0").rstrip(".")                 + metric_sfx if False else f"{fval:.1f}{metric_sfx}"
 
 
 # ─────────────────────────────────────────────
@@ -110,13 +143,18 @@ def discover_fields(frames: list[Frame]) -> dict[str, list[str]]:
 #  CHANGE DETECTION + OUTPUT GENERATION
 # ─────────────────────────────────────────────
 
-def format_subtitle_line(fields: dict[str, str], selected: list[str], labels: dict[str, str]) -> str:
+def format_subtitle_line(
+    fields: dict[str, str],
+    selected: list[str],
+    labels: dict[str, str],
+    imperial: bool = False,
+) -> str:
     """Format selected fields as a compact single line: Val1 | Val2 | Val3"""
     parts = []
     for key in selected:
         if key in fields:
             label = labels.get(key, "")
-            val = fields[key]
+            val = convert_value(key, fields[key], imperial)
             parts.append(f"{label}{val}" if label else val)
     return " | ".join(parts)
 
@@ -135,6 +173,7 @@ def generate_output_srt(
     selected_fields: list[str],
     labels: dict[str, str],
     min_interval_ms: int,
+    imperial: bool = False,
 ) -> str:
     """
     Walk frames, emit a new subtitle block only when:
@@ -142,10 +181,8 @@ def generate_output_srt(
       2. The visible content has actually changed.
     The subtitle block stays on screen until the next change or end of clip.
     """
-    output_blocks = []
     last_emit_time: Optional[timedelta] = None
     last_content: Optional[str] = None
-    last_start: Optional[timedelta] = None
 
     min_td = timedelta(milliseconds=min_interval_ms)
     pending: list[tuple[timedelta, timedelta, str]] = []  # (start, end, content)
@@ -157,7 +194,7 @@ def generate_output_srt(
             pending[-1] = (s, next_start, c)
 
     for frame in frames:
-        content = format_subtitle_line(frame.fields, selected_fields, labels)
+        content = format_subtitle_line(frame.fields, selected_fields, labels, imperial)
         if not content:
             continue
 
@@ -177,6 +214,10 @@ def generate_output_srt(
                 s, _, c = pending[-1]
                 pending[-1] = (s, frame.end, c)
 
+    # Extend the final block to the last frame's end time
+    if frames:
+        flush_pending(frames[-1].end)
+
     # Build SRT text
     out_lines = []
     for i, (start, end, content) in enumerate(pending, 1):
@@ -193,18 +234,19 @@ def generate_output_srt(
 # ─────────────────────────────────────────────
 
 HELP_TEXT = [
-    "  ↑/↓   navigate fields",
-    "  SPACE  toggle field on/off",
-    "  a      select all / none",
-    "  l      edit label for field",
-    "  +/-    adjust min interval",
-    "  ENTER  process & save",
-    "  q      quit",
+    "  ↑/↓      navigate fields",
+    "  [/]      move field up/down in output order",
+    "  SPACE     toggle field on/off",
+    "  a         select all / none",
+    "  l         edit label (auto-selects field)",
+    "  u         toggle metric/imperial units",
+    "  +/-       adjust min interval",
+    "  ENTER     process & save",
+    "  q         quit",
 ]
 
 def run_tui(stdscr, frames: list[Frame], output_path: Path, default_interval_ms: int = 2000):
     """Interactive field selector TUI."""
-    curses.curs_off = False
     curses.start_color()
     curses.use_default_colors()
     curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)    # selected highlight
@@ -222,8 +264,38 @@ def run_tui(stdscr, frames: list[Frame], output_path: Path, default_interval_ms:
     enabled = {k: False for k in all_fields}
     labels: dict[str, str] = {}
     interval_ms = default_interval_ms
+    imperial = False
     scroll_offset = 0
     status_msg = ""
+
+    def resort_fields():
+        """Float enabled fields to the top, preserving relative order within each group.
+        Resets scroll_offset so the cursor is never stranded off-screen after a sort."""
+        nonlocal scroll_offset
+        current = all_fields[cursor]
+        all_fields.sort(key=lambda k: (0 if enabled[k] else 1))
+        new_cursor = all_fields.index(current)
+        # Reset scroll so the cursor is at the top of the visible window.
+        # draw() will fine-tune it if needed, but this prevents stale offsets.
+        scroll_offset = max(0, new_cursor - 2)
+        return new_cursor
+
+
+    def safe_addstr(y, x, text, *attrs):
+        """addstr that won't crash on the last cell of the screen."""
+        h, w = stdscr.getmaxyx()
+        # Clamp text so it never fills the very last cell (bottom-right corner)
+        max_len = (w - x - 1) if y == h - 1 else (w - x)
+        text = text[:max_len]
+        if not text:
+            return
+        try:
+            if attrs:
+                stdscr.addstr(y, x, text, *attrs)
+            else:
+                stdscr.addstr(y, x, text)
+        except curses.error:
+            pass
 
     def draw():
         nonlocal scroll_offset
@@ -235,7 +307,8 @@ def run_tui(stdscr, frames: list[Frame], output_path: Path, default_interval_ms:
         safe_addstr(0, 0, header.ljust(w - 1)[: w - 1], curses.color_pair(4) | curses.A_BOLD)
 
         # ── Interval bar ────────────────────────────────────────
-        interval_str = f"  Min interval: {interval_ms:,} ms  (+/- to adjust)"
+        units_str = "imperial (ft/mph)" if imperial else "metric (m/m/s)"
+        interval_str = f"  Min interval: {interval_ms:,} ms  (+/- to adjust)   Units: {units_str}  (u to toggle)"
         safe_addstr(1, 0, interval_str.ljust(w - 1)[: w - 1], curses.color_pair(3))
 
         # ── Column headers ──────────────────────────────────────
@@ -247,31 +320,59 @@ def run_tui(stdscr, frames: list[Frame], output_path: Path, default_interval_ms:
         list_bottom = h - len(HELP_TEXT) - 3
         visible_rows = list_bottom - list_top
 
-        # Scroll to keep cursor visible
+        def screen_rows_from(from_fi: int, to_fi: int) -> int:
+            """Count screen rows occupied between from_fi and to_fi (inclusive
+            of any divider that falls in that range)."""
+            count = 0
+            for i in range(from_fi, to_fi + 1):
+                if i > 0 and not enabled[all_fields[i]] and enabled[all_fields[i - 1]]:
+                    count += 1  # divider row
+                count += 1      # field row
+            return count
+
+        # Scroll up: cursor moved above the visible window top.
         if cursor < scroll_offset:
             scroll_offset = cursor
-        elif cursor >= scroll_offset + visible_rows:
-            scroll_offset = cursor - visible_rows + 1
 
-        for row_i in range(visible_rows):
-            fi = row_i + scroll_offset
-            if fi >= len(all_fields):
+        # Scroll down: advance scroll_offset until the cursor fits within
+        # visible_rows, counting divider rows that fall in the window.
+        while scroll_offset < cursor:
+            rows_used = screen_rows_from(scroll_offset, cursor)
+            if rows_used <= visible_rows:
                 break
-            key = all_fields[fi]
-            is_cursor = (fi == cursor)
-            is_on = enabled[key]
-            label = labels.get(key, "")
-            samples = ", ".join(field_info[key][:3])
+            scroll_offset += 1
 
+        # Use separate field index (fi) and screen row (screen_row) so the
+        # divider row doesn't throw off the cursor highlight.
+        screen_row = 0
+        fi = scroll_offset
+        while screen_row < visible_rows and fi < len(all_fields):
+            key = all_fields[fi]
+            is_on = enabled[key]
+
+            # Draw a divider when transitioning from enabled to disabled group
+            if fi > 0 and not is_on and enabled[all_fields[fi - 1]]:
+                safe_addstr(list_top + screen_row, 0, "  " + "·" * (w - 4))
+                screen_row += 1
+                if screen_row >= visible_rows:
+                    break
+
+            is_cursor = (fi == cursor)
+            label = labels.get(key, "")
+            samples = ", ".join(
+                convert_value(key, v, imperial) for v in field_info[key][:3]
+            )
             check = "●" if is_on else "○"
             line = f"  {check}   {key:<22}  {label:<12}  {samples}"
-            line = line[:w]
 
             if is_cursor:
-                safe_addstr(list_top + row_i, 0, line.ljust(w - 1)[: w - 1], curses.color_pair(1) | curses.A_BOLD)
+                safe_addstr(list_top + screen_row, 0, line.ljust(w - 1)[: w - 1], curses.color_pair(1) | curses.A_BOLD)
             else:
                 attr = curses.color_pair(2) if is_on else curses.color_pair(6)
-                safe_addstr(list_top + row_i, 0, line[: w - 1], attr)
+                safe_addstr(list_top + screen_row, 0, line[: w - 1], attr)
+
+            screen_row += 1
+            fi += 1
 
         # ── Help block ──────────────────────────────────────────
         help_top = h - len(HELP_TEXT) - 2
@@ -305,22 +406,6 @@ def run_tui(stdscr, frames: list[Frame], output_path: Path, default_interval_ms:
 
     curses.curs_set(0)
 
-    def safe_addstr(y, x, text, *attrs):
-        """addstr that won't crash on the last cell of the screen."""
-        h, w = stdscr.getmaxyx()
-        # Clamp text so it never fills the very last cell (bottom-right corner)
-        max_len = (w - x - 1) if y == h - 1 else (w - x)
-        text = text[:max_len]
-        if not text:
-            return
-        try:
-            if attrs:
-                stdscr.addstr(y, x, text, *attrs)
-            else:
-                stdscr.addstr(y, x, text)
-        except curses.error:
-            pass
-
     while True:
         draw()
         key = stdscr.getch()
@@ -332,19 +417,37 @@ def run_tui(stdscr, frames: list[Frame], output_path: Path, default_interval_ms:
         elif key == ord(" "):
             k = all_fields[cursor]
             enabled[k] = not enabled[k]
+            cursor = resort_fields()
             status_msg = ""
         elif key == ord("a"):
             any_on = any(enabled.values())
             for k in all_fields:
                 enabled[k] = not any_on
+            cursor = resort_fields()
         elif key == ord("l"):
             k = all_fields[cursor]
             new_label = prompt_label(k)
             if new_label:
                 labels[k] = new_label + ": "
+                enabled[k] = True  # auto-select when a label is assigned
+                cursor = resort_fields()
+                status_msg = f"Label for '{k}' set and field selected."
             else:
                 labels.pop(k, None)
-            status_msg = f"Label for '{k}' set."
+                status_msg = f"Label for '{k}' cleared."
+        elif key == ord("["):
+            if cursor > 0:
+                all_fields[cursor], all_fields[cursor - 1] = all_fields[cursor - 1], all_fields[cursor]
+                cursor -= 1
+                status_msg = ""
+        elif key == ord("]"):
+            if cursor < len(all_fields) - 1:
+                all_fields[cursor], all_fields[cursor + 1] = all_fields[cursor + 1], all_fields[cursor]
+                cursor += 1
+                status_msg = ""
+        elif key == ord("u"):
+            imperial = not imperial
+            status_msg = f"Units: {"imperial" if imperial else "metric"}"
         elif key == ord("+") or key == ord("="):
             interval_ms = min(30000, interval_ms + 500)
         elif key == ord("-"):
@@ -355,7 +458,7 @@ def run_tui(stdscr, frames: list[Frame], output_path: Path, default_interval_ms:
                 status_msg = "⚠  Select at least one field first!"
                 continue
             # Generate and write
-            srt_text = generate_output_srt(frames, selected, labels, interval_ms)
+            srt_text = generate_output_srt(frames, selected, labels, interval_ms, imperial)
             output_path.write_text(srt_text, encoding="utf-8")
             status_msg = f"✓ Saved {output_path} ({srt_text.count(chr(10))} lines)"
             draw()

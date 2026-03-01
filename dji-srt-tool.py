@@ -48,7 +48,7 @@ def convert_value(field: str, raw: str, imperial: bool) -> str:
     if imperial:
         return f"{fn(fval):.1f}{imperial_sfx}"
     else:
-        return f"{fval:.2f}{metric_sfx}".rstrip("0").rstrip(".")                 + metric_sfx if False else f"{fval:.1f}{metric_sfx}"
+        return f"{fval:.1f}{metric_sfx}"
 
 
 # ─────────────────────────────────────────────
@@ -447,7 +447,7 @@ def run_tui(stdscr, frames: list[Frame], output_path: Path, default_interval_ms:
                 status_msg = ""
         elif key == ord("u"):
             imperial = not imperial
-            status_msg = f"Units: {"imperial" if imperial else "metric"}"
+            status_msg = f"Units: {'imperial' if imperial else 'metric'}"
         elif key == ord("+") or key == ord("="):
             interval_ms = min(30000, interval_ms + 500)
         elif key == ord("-"):
